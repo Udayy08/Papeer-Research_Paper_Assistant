@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[c]
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Environment variables / secrets
+.env
+
+# Local embedding cache
+embedding_cache/
+
+# Local runtime / application state
+checkpoints.db
+checkpoints.db-*
+sessions.json
+
+# Streamlit local state
+.streamlit/
