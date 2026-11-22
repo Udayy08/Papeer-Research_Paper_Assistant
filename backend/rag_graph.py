@@ -19,11 +19,87 @@ from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
 from backend.models import ClaimVerificationResult, RelevancyDecision, RouterDecision
+from backend.usage_tracker import (
+    QueryUsageTracker,
+    get_current_tracker,
+    reset_current_tracker,
+    set_current_tracker,
+)
 from backend.vector_store import search as vs_search
 
 load_dotenv()
 
-llm = ChatGroq(model="openai/gpt-oss-120b")
+# ── Quota & Safeguard Configuration ──────────────────────────────────────────
+
+DEFAULT_GROQ_MAX_OUTPUT_TOKENS = 1024
+DEFAULT_MAX_QUERY_LLM_CALLS = 5
+
+
+def resolve_groq_max_output_tokens(explicit: int | None = None) -> int:
+    import sys
+    if explicit is not None:
+        return explicit if explicit > 0 else DEFAULT_GROQ_MAX_OUTPUT_TOKENS
+    env_val = os.environ.get("GROQ_MAX_OUTPUT_TOKENS", "").strip()
+    if not env_val:
+        return DEFAULT_GROQ_MAX_OUTPUT_TOKENS
+    try:
+        val = int(env_val)
+        return val if val > 0 else DEFAULT_GROQ_MAX_OUTPUT_TOKENS
+    except ValueError:
+        print(
+            f"[Warning] Invalid GROQ_MAX_OUTPUT_TOKENS '{env_val}', falling back to {DEFAULT_GROQ_MAX_OUTPUT_TOKENS}",
+            file=sys.stderr,
+        )
+        return DEFAULT_GROQ_MAX_OUTPUT_TOKENS
+
+
+def resolve_max_query_llm_calls() -> int:
+    import sys
+    env_val = os.environ.get("MAX_QUERY_LLM_CALLS", "").strip()
+    if not env_val:
+        return DEFAULT_MAX_QUERY_LLM_CALLS
+    try:
+        val = int(env_val)
+        return val if val > 0 else DEFAULT_MAX_QUERY_LLM_CALLS
+    except ValueError:
+        print(
+            f"[Warning] Invalid MAX_QUERY_LLM_CALLS '{env_val}', falling back to {DEFAULT_MAX_QUERY_LLM_CALLS}",
+            file=sys.stderr,
+        )
+        return DEFAULT_MAX_QUERY_LLM_CALLS
+
+
+def create_production_llm(max_tokens: int | None = None) -> ChatGroq:
+    """Creates a production ChatGroq instance configured with:
+    1. Model: openai/gpt-oss-120b
+    2. Output token budget: resolve_groq_max_output_tokens(max_tokens)
+    3. max_retries=1
+    4. Circuit breaker: disallow retries on HTTP 429, 401, 403
+    """
+    resolved_max_tokens = resolve_groq_max_output_tokens(max_tokens)
+    llm_instance = ChatGroq(
+        model="openai/gpt-oss-120b",
+        max_tokens=resolved_max_tokens,
+        max_retries=1,
+    )
+    for client_attr in ("client", "async_client"):
+        if hasattr(llm_instance, client_attr):
+            client_obj = getattr(llm_instance, client_attr)
+            if hasattr(client_obj, "_client"):
+                raw_client = client_obj._client
+                orig_should_retry = raw_client._should_retry
+
+                def safe_should_retry(response, orig=orig_should_retry):
+                    if hasattr(response, "status_code") and response.status_code in (429, 401, 403):
+                        return False
+                    return orig(response)
+
+                raw_client._should_retry = safe_should_retry
+
+    return llm_instance
+
+
+llm = create_production_llm()
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -119,8 +195,21 @@ def web_search(
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> list:
     """Search the web for current or supplementary information using Tavily."""
+    import time
     client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-    results = client.search(optimized_query, max_results=max_results)
+    tracker = get_current_tracker()
+    start_t = time.perf_counter()
+    try:
+        results = client.search(optimized_query, max_results=max_results)
+        lat_ms = (time.perf_counter() - start_t) * 1000
+        if tracker:
+            tracker.record_tavily(requests=1, latency_ms=lat_ms, failed=False)
+    except Exception:
+        lat_ms = (time.perf_counter() - start_t) * 1000
+        if tracker:
+            tracker.record_tavily(requests=1, latency_ms=lat_ms, failed=True)
+        raise
+
     if not results.get("results"):
         return [ToolMessage(content="No web results found.", tool_call_id=tool_call_id)]
     web_docs = [
@@ -188,19 +277,26 @@ QUERY_REWRITE_SYSTEM = (
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def agent_node(state: RAGState) -> dict:
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
     current_attempts = state.get("retrieval_attempts", 0)
-    # Once at the cap, use plain LLM so the agent cannot emit more tool calls.
-    # This prevents orphaned tool_call IDs from entering the persisted message history.
-    # retrieval llm --> tool call --> tool result
-    # llm --> no tools are bounded --> tool call
-    lm = llm if current_attempts >= MAX_RETRIEVAL_ATTEMPTS else retrieval_llm
-    
+
+    if current_calls >= max_calls or current_attempts >= MAX_RETRIEVAL_ATTEMPTS:
+        docs = state.get("retrieved_docs") or []
+        if docs:
+            return {"messages": [AIMessage(content="CONTEXT_GATHERED")]}
+        else:
+            return {"messages": [AIMessage(content="INSUFFICIENT_CONTEXT_BUDGET_EXHAUSTED")]}
+
+    lm = retrieval_llm
+
     recent_messages = []
     for msg in reversed(state["messages"]):
         recent_messages.insert(0, msg)
         if msg.type == "human":
             break
-            
+
     import datetime
     dynamic_system = (
         f"{RETRIEVE_SYSTEM}\n\n"
@@ -219,11 +315,17 @@ def agent_node(state: RAGState) -> dict:
 
 
 def relevancy_check_node(state: RAGState) -> dict:
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
     query = state["query"]
     docs = state.get("retrieved_docs") or []
     doc_snippets = "\n\n---\n\n".join(doc.page_content[:300] for doc in docs[:3])
     if not doc_snippets:
         return {"is_relevant": False}
+    if current_calls >= max_calls:
+        return {"is_relevant": True}
+
     prompt = (
         f"Question: {query}\n\nRetrieved chunks:\n{doc_snippets}\n\n"
         "Are these chunks relevant to answering the question?"
@@ -236,8 +338,18 @@ def relevancy_check_node(state: RAGState) -> dict:
 
 
 def query_rewrite_node(state: RAGState) -> dict:
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
     original_query = state["query"]
     rewrite_count = state.get("rewrite_count", 0)
+
+    if current_calls >= max_calls:
+        return {
+            "rewrite_count": rewrite_count + 1,
+            "is_relevant": False,
+        }
+
     response = llm.invoke([
         {"role": "system", "content": QUERY_REWRITE_SYSTEM},
         {"role": "user", "content": f"Original query: {original_query}\n\nWrite an improved search query."},
@@ -270,20 +382,52 @@ verification_llm = llm.with_structured_output(ClaimVerificationResult)
 
 
 def verify_claim_node(state: RAGState) -> dict:
+    import time
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
+
+    if current_calls >= max_calls:
+        return {
+            "claim_verdict": "Verification call budget reached before LLM analysis could complete.",
+            "claim_source": None,
+            "superseding_papers": [],
+        }
+
     claim = state["messages"][-1].content
     tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
     # General web search for recent work superseding the claim
-    general_results = tavily_client.search(
-        f"recent research superseding: {claim[:200]}",
-        max_results=5,
-    ).get("results", [])
+    start_g = time.perf_counter()
+    try:
+        general_results = tavily_client.search(
+            f"recent research superseding: {claim[:200]}",
+            max_results=5,
+        ).get("results", [])
+        lat_g = (time.perf_counter() - start_g) * 1000
+        if tracker:
+            tracker.record_tavily(requests=1, latency_ms=lat_g, failed=False)
+    except Exception:
+        lat_g = (time.perf_counter() - start_g) * 1000
+        if tracker:
+            tracker.record_tavily(requests=1, latency_ms=lat_g, failed=True)
+        raise
 
     # arXiv-targeted search via web to get paper titles and links
-    arxiv_results = tavily_client.search(
-        f"site:arxiv.org {claim[:200]}",
-        max_results=5,
-    ).get("results", [])
+    start_a = time.perf_counter()
+    try:
+        arxiv_results = tavily_client.search(
+            f"site:arxiv.org {claim[:200]}",
+            max_results=5,
+        ).get("results", [])
+        lat_a = (time.perf_counter() - start_a) * 1000
+        if tracker:
+            tracker.record_tavily(requests=1, latency_ms=lat_a, failed=False)
+    except Exception:
+        lat_a = (time.perf_counter() - start_a) * 1000
+        if tracker:
+            tracker.record_tavily(requests=1, latency_ms=lat_a, failed=True)
+        raise
 
     # Build context block
     lines = ["=== General Web Search Results ==="]
@@ -324,37 +468,64 @@ def verify_claim_node(state: RAGState) -> dict:
 def generate_answer_node(state: RAGState) -> dict:
     route = state.get("route")
     query = state["query"]
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
 
     if route == "retrieve":
-        if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1:
+        last_msg = state["messages"][-1].content if state.get("messages") else ""
+        docs = state.get("retrieved_docs") or []
+
+        if (
+            "INSUFFICIENT_CONTEXT" in last_msg
+            or not docs
+            or (state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1)
+        ):
             answer = (
-                "I wasn't able to find relevant information in the uploaded papers "
-                "to answer your question. You may want to rephrase your question "
-                "or upload additional papers."
+                "I was unable to find sufficient context in the uploaded documents "
+                "to answer your question accurately. Please refine your question "
+                "or upload relevant materials."
+            )
+        elif current_calls >= max_calls:
+            unique_docs = []
+            seen_content = set()
+            for doc in docs:
+                if doc.page_content not in seen_content:
+                    seen_content.add(doc.page_content)
+                    unique_docs.append(doc)
+            snippets = "\n\n".join(f"- {d.page_content[:300]}" for d in unique_docs[:3])
+            answer = (
+                f"Query LLM call budget reached ({max_calls} calls). "
+                f"Here is the retrieved evidence from the documents:\n\n{snippets}"
             )
         else:
-            docs = state.get("retrieved_docs") or []
-            if not docs:
-                answer = "I don't know the answer."
-            else:
-                import datetime
-                context = "\n\n---\n\n".join(
-                    f"Source: {doc.metadata.get('title', 'Unknown')}\n"
-                    f"URL: {doc.metadata.get('url', 'Unknown')}\n"
-                    f"{doc.page_content}"
-                    for doc in docs
-                )
-                prompt = (
-                    f"The current date is {datetime.date.today()}.\n"
-                    f"Answer the question using the provided context.\n"
-                    f"- For time-sensitive questions, prefer information explicitly dated closest to the current date.\n"
-                    f"- Do not treat historical information as current information.\n"
-                    f"- If sources conflict, compare their dates and source information before answering.\n"
-                    f"- If the context does not contain enough evidence to establish the current value, do not guess.\n"
-                    f"- Clearly mention uncertainty or conflicting sources when necessary.\n\n"
-                    f"Context:\n{context}\n\nQuestion: {query}"
-                )
-                answer = llm.invoke([{"role": "user", "content": prompt}]).content
+            import datetime
+            unique_docs = []
+            seen_content = set()
+            for doc in docs:
+                if doc.page_content not in seen_content:
+                    seen_content.add(doc.page_content)
+                    unique_docs.append(doc)
+
+            unique_docs = unique_docs[:15]
+
+            context = "\n\n---\n\n".join(
+                f"Source: {doc.metadata.get('title', 'Unknown')}\n"
+                f"URL: {doc.metadata.get('url', 'Unknown')}\n"
+                f"{doc.page_content}"
+                for doc in unique_docs
+            )
+            prompt = (
+                f"The current date is {datetime.date.today()}.\n"
+                f"Answer the question using the provided context.\n"
+                f"- For time-sensitive questions, prefer information explicitly dated closest to the current date.\n"
+                f"- Do not treat historical information as current information.\n"
+                f"- If sources conflict, compare their dates and source information before answering.\n"
+                f"- If the context does not contain enough evidence to establish the current value, do not guess.\n"
+                f"- Clearly mention uncertainty or conflicting sources when necessary.\n\n"
+                f"Context:\n{context}\n\nQuestion: {query}"
+            )
+            answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
     elif route == "verify_claim":
         verdict = state.get("claim_verdict", "")
@@ -383,8 +554,11 @@ def generate_answer_node(state: RAGState) -> dict:
             )
 
     else:  # direct_answer
-        prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
-        answer = llm.invoke([{"role": "user", "content": prompt}]).content
+        if current_calls >= max_calls:
+            answer = f"Query LLM call budget reached ({max_calls} calls). Unable to generate direct answer."
+        else:
+            prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
+            answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
     return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
@@ -405,17 +579,79 @@ def agent_routing(state: RAGState) -> str:
     tc = tools_condition(state)
     if tc == "tools":
         return "retrieval"
-    if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS:
+
+    last_msg = state["messages"][-1].content if state.get("messages") else ""
+    if "INSUFFICIENT_CONTEXT" in last_msg:
+        return "generate_answer"
+
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
+
+    if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS or current_calls >= max_calls:
         return "generate_answer"
     return "relevancy_check"
 
 
 def after_relevancy_routing(state: RAGState) -> str:
+    tracker = get_current_tracker()
+    current_calls = tracker.groq_calls if tracker else 0
+    max_calls = resolve_max_query_llm_calls()
+
+    if current_calls >= max_calls:
+        return "generate_answer"
     if state.get("is_relevant", False):
         return "generate_answer"
     if state.get("rewrite_count", 0) < 1:
         return "query_rewrite"
     return "generate_answer"
+
+
+def sanitize_checkpoint_messages(graph: Any, config: dict) -> list[str]:
+    """Inspects the checkpoint state for unmatched tool calls and heals them by appending
+    synthetic ToolMessages. Returns list of healed tool call IDs."""
+    try:
+        state = graph.get_state(config)
+        if not state or not state.values:
+            return []
+        messages = state.values.get("messages", [])
+        if not messages:
+            return []
+
+        called_tools: dict[str, str] = {}
+        for msg in messages:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    if tc_id:
+                        name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "tool")
+                        called_tools[tc_id] = name
+
+        responded_tools: set[str] = set()
+        for msg in messages:
+            if isinstance(msg, ToolMessage) or getattr(msg, "type", None) == "tool":
+                tc_id = getattr(msg, "tool_call_id", None)
+                if tc_id:
+                    responded_tools.add(tc_id)
+
+        unfulfilled = [tc_id for tc_id in called_tools if tc_id not in responded_tools]
+        if not unfulfilled:
+            return []
+
+        healing_messages = [
+            ToolMessage(
+                content="[Execution Interrupted] This tool invocation was interrupted before completion.",
+                tool_call_id=tc_id,
+                name=called_tools.get(tc_id, "interrupted_tool"),
+            )
+            for tc_id in unfulfilled
+        ]
+        graph.update_state(config, {"messages": healing_messages})
+        return unfulfilled
+    except Exception as e:
+        import sys
+        print(f"[Warning] Failed to sanitize checkpoint: {e}", file=sys.stderr)
+        return []
 
 
 def build_graph(db_path: str = "checkpoints.db"):

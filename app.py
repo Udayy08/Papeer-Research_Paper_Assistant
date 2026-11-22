@@ -13,7 +13,12 @@ from langchain_groq import ChatGroq
 
 from backend.btw_handler import handle_btw
 from backend.paper_loader import load_arxiv, load_document, load_webpage
-from backend.rag_graph import build_graph
+from backend.rag_graph import build_graph, create_production_llm, sanitize_checkpoint_messages
+from backend.usage_tracker import (
+    QueryUsageTracker,
+    reset_current_tracker,
+    set_current_tracker,
+)
 from backend.vector_store import add_paper, list_papers
 
 st.set_page_config(page_title="Papeer", page_icon="📚", layout="centered")
@@ -25,7 +30,7 @@ def get_graph():
 
 
 SESSIONS_FILE = Path("sessions.json")
-_rename_llm = ChatGroq(model="openai/gpt-oss-120b")
+_rename_llm = create_production_llm(max_tokens=64)
 
 
 def load_sessions() -> dict:
@@ -64,8 +69,110 @@ def _serialize_state(values: dict) -> dict:
     return out
 
 
-def generate_session_name(first_message: str) -> str:
+def render_usage_breakdown(usage: dict, turn: int) -> None:
+    with st.expander(f"Usage & Quota Breakdown · turn {turn}", expanded=False):
+        groq = usage.get("groq", {})
+        gemini = usage.get("gemini", {})
+        tavily = usage.get("tavily", {})
+        qdrant = usage.get("qdrant", {})
+        total_lat = usage.get("total_latency_ms", 0.0)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Groq Total Tokens (Actual)", f"{groq.get('total_tokens', 0):,}")
+        col2.metric("Overall Latency", f"{total_lat / 1000:.2f}s")
+        col3.metric("Groq Model", groq.get("model_name", "openai/gpt-oss-120b"))
+
+        st.markdown("---")
+        st.markdown("**🧠 Groq LLM (Actual)**")
+        st.markdown(
+            f"- **Invocations:** {groq.get('calls', 0)}  "
+            f"| **Prompt Tokens:** {groq.get('input_tokens', 0):,}  "
+            f"| **Completion Tokens:** {groq.get('output_tokens', 0):,}  "
+            f"| **Latency:** {groq.get('latency_ms', 0):.1f} ms  "
+            f"| **Errors:** {groq.get('errors', 0)}"
+        )
+
+        st.markdown("**💎 Gemini Embeddings (Actual Hits/Misses · Estimated Tokens)**")
+        st.markdown(
+            f"- **Query Cache:** {gemini.get('query_hits', 0)} Hits / {gemini.get('query_misses', 0)} Misses  "
+            f"| **Doc Cache:** {gemini.get('doc_hits', 0)} Hits / {gemini.get('doc_misses', 0)} Misses  "
+            f"| **API Requests:** {gemini.get('api_calls', 0)}  "
+            f"| **Texts Embedded:** {gemini.get('texts_embedded', 0)}  "
+            f"| **Estimated Tokens:** ~{gemini.get('estimated_tokens', 0):,}"
+        )
+
+        st.markdown("**🔍 Web & Vector Search (Actual)**")
+        st.markdown(
+            f"- **Tavily Searches:** {tavily.get('requests', 0)} (Failures: {tavily.get('failures', 0)}) · {tavily.get('latency_ms', 0):.1f} ms  \n"
+            f"- **Qdrant Searches:** {qdrant.get('searches', 0)} ({qdrant.get('chunks_retrieved', 0)} chunks retrieved) · {qdrant.get('latency_ms', 0):.1f} ms"
+        )
+
+
+def format_user_error_message(exc: Exception) -> tuple[str, str]:
+    """Classifies exceptions into user-friendly messages without leaking sensitive API keys,
+    system prompts, or internal stack traces.
+    Returns: (category, friendly_message)
+    """
+    err_str = str(exc)
+    err_type = type(exc).__name__
+    lower_err = err_str.lower()
+
+    # Rate Limiting & Quota Exhaustion
+    if "429" in err_str or "rate limit" in lower_err or err_type == "RateLimitError":
+        if "quota" in lower_err or "daily" in lower_err or "exceeded your current quota" in lower_err:
+            return (
+                "Quota Exhausted",
+                "Your AI provider quota limit has been reached for this period. "
+                "Please check your account plan or wait for quota reset before asking further questions.",
+            )
+        return (
+            "Rate Limited",
+            "Rate limit reached (HTTP 429). Please wait a moment before sending another query.",
+        )
+
+    # Authentication & Permissions
+    if (
+        "401" in err_str
+        or "403" in err_str
+        or "unauthorized" in lower_err
+        or "forbidden" in lower_err
+        or "invalid api key" in lower_err
+        or err_type in ("AuthenticationError", "PermissionDeniedError")
+    ):
+        return (
+            "Authentication Error",
+            "Authentication failed with the AI service. Please verify that your API keys are configured correctly.",
+        )
+
+    # Provider Server Errors
+    if (
+        any(code in err_str for code in ("500", "502", "503", "504"))
+        or "service unavailable" in lower_err
+        or "internal server error" in lower_err
+        or err_type in ("ServerError", "InternalServerError", "BadGatewayError", "ServiceUnavailableError")
+    ):
+        return (
+            "Service Temporarily Unavailable",
+            "The AI provider is temporarily experiencing high load or server errors. Please try again in a few moments.",
+        )
+
+    # Network Timeouts
+    if "timeout" in lower_err or "timed out" in lower_err or err_type in ("Timeout", "ReadTimeout", "ConnectTimeout"):
+        return (
+            "Request Timeout",
+            "The request timed out while communicating with the AI service. Please check your network connection and try again.",
+        )
+
+    # Generic Fallback (sanitized)
+    return (
+        "Execution Error",
+        f"An error occurred while processing your request ({err_type}). Please try again or rephrase your question.",
+    )
+
+
+def generate_session_name(first_message: str, tracker: QueryUsageTracker | None = None) -> str:
     try:
+        config = {"callbacks": [tracker]} if tracker else None
         response = _rename_llm.invoke(
             [
                 {
@@ -77,17 +184,18 @@ def generate_session_name(first_message: str) -> str:
                     ),
                 },
                 {"role": "user", "content": first_message[:500]},
-            ]
+            ],
+            config=config,
         )
         return response.content.strip()
     except Exception:
         return "New Session"
 
 
-def maybe_rename_session(session_id: str, first_message: str) -> None:
+def maybe_rename_session(session_id: str, first_message: str, tracker: QueryUsageTracker | None = None) -> None:
     if st.session_state.sessions_meta.get(session_id, {}).get("is_named"):
         return
-    name = generate_session_name(first_message)
+    name = generate_session_name(first_message, tracker=tracker)
     st.session_state.sessions_meta[session_id]["name"] = name
     st.session_state.sessions_meta[session_id]["is_named"] = True
     save_sessions(st.session_state.sessions_meta)
@@ -309,6 +417,8 @@ for msg in st.session_state.chats.get(active_sid, []):
         if msg["role"] == "assistant":
             with st.expander(f"📊 Graph state · turn {msg['turn']}", expanded=False):
                 st.json(msg["graph_state"])
+            if "usage" in msg and msg["usage"]:
+                render_usage_breakdown(msg["usage"], msg["turn"])
 
 # ── Chat input ─────────────────────────────────────────────────────────────────
 if prompt := st.chat_input("Ask about your papers, verify a claim, or search the web…"):
@@ -327,10 +437,17 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             else:
                 placeholder = st.empty()
                 response_text = ""
-                for chunk in handle_btw(query):
-                    response_text += chunk
-                    placeholder.markdown(response_text + "▌")
-                placeholder.markdown(response_text)
+                tracker = QueryUsageTracker(session_id=active_sid, query_id=str(uuid.uuid4()))
+                token = set_current_tracker(tracker)
+                try:
+                    for chunk in handle_btw(query, tracker=tracker):
+                        response_text += chunk
+                        placeholder.markdown(response_text + "▌")
+                    placeholder.markdown(response_text)
+                finally:
+                    reset_current_tracker(token)
+                usage_record = tracker.to_dict()
+                render_usage_breakdown(usage_record, st.session_state.turns.get(active_sid, 0))
             st.caption("Side channel — not saved to session history.")
 
     else:
@@ -347,8 +464,11 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
         st.session_state.turns[active_sid] += 1
         current_turn = st.session_state.turns[active_sid]
 
+        tracker = QueryUsageTracker(session_id=active_sid, query_id=str(uuid.uuid4()))
+        token = set_current_tracker(tracker)
+
         if is_first_message:
-            maybe_rename_session(active_sid, prompt)
+            maybe_rename_session(active_sid, prompt, tracker=tracker)
 
         input_state = {
             "messages": [HumanMessage(content=prompt)],
@@ -364,13 +484,17 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             "is_relevant": None,
             "rewrite_count": 0,
         }
-        config = {"configurable": {"thread_id": active_sid}}
+        config = {
+            "configurable": {"thread_id": active_sid},
+            "callbacks": [tracker],
+        }
 
         with st.chat_message("assistant"):
             placeholder = st.empty()
             response_text = ""
 
             try:
+                sanitize_checkpoint_messages(graph, config)
                 for chunk, metadata in graph.stream(input_state, config, stream_mode="messages"):
                     if (
                         metadata.get("langgraph_node") == "generate_answer"
@@ -386,27 +510,25 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
 
                 placeholder.markdown(response_text)
                 state_snapshot = _serialize_state(final_values)
-                
+
             except Exception as e:
-                err_str = str(e)
-                err_type = type(e).__name__
-                if "429" in err_str or err_type == "RateLimitError":
-                    st.error("Groq rate limit reached (HTTP 429). Please wait a moment before asking another question.")
-                    response_text = "*(Groq rate limit reached)*"
-                elif "503" in err_str or err_type in ["ServerError", "InternalServerError"]:
-                    st.error("An AI provider (Groq or Gemini) is temporarily unavailable due to high demand. Please try again.")
-                    response_text = "*(AI provider temporarily unavailable)*"
-                else:
-                    st.error(f"An unexpected error occurred: {err_type} - {err_str}")
-                    response_text = f"*(Error: {err_type})*"
-                
+                category, friendly_msg = format_user_error_message(e)
+                st.error(f"**{category}:** {friendly_msg}")
+                response_text = f"*({category}: {friendly_msg})*"
+
+                sanitize_checkpoint_messages(graph, config)
                 try:
                     state_snapshot = _serialize_state(graph.get_state(config).values)
                 except Exception:
                     state_snapshot = {"error": "Could not retrieve state after crash"}
+            finally:
+                reset_current_tracker(token)
+
+            usage_record = tracker.to_dict()
 
             with st.expander(f"📊 Graph state · turn {current_turn}", expanded=False):
                 st.json(state_snapshot)
+            render_usage_breakdown(usage_record, current_turn)
 
         st.session_state.chats[active_sid].append(
             {
@@ -414,6 +536,7 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
                 "content": response_text,
                 "graph_state": state_snapshot,
                 "turn": current_turn,
+                "usage": usage_record,
             }
         )
 
