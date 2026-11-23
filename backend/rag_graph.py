@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import warnings
-from typing import Annotated
+from typing import Annotated, Any
 
 warnings.filterwarnings("ignore", message="The default value of `allowed_objects`")
 
